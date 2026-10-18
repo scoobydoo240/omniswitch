@@ -238,8 +238,8 @@ Raw `request_body` and `response_body` are present only when
 `log_payloads: true` is explicitly enabled; metadata, usage, cache, and status
 remain available by default.
 
-Each log row has `workspace_id` and `organization_id` when the caller that
-sent the request had a tenant. The results contain only rows of the caller's
+Each log row, including MCP tool calls, has `workspace_id` and
+`organization_id` when the caller that sent the request had a tenant. The results contain only rows of the caller's
 [tenant](#tenant-scope).
 
 ### `GET /api/metrics`
@@ -576,8 +576,13 @@ membership in one of its workspaces:
 - A workspace the caller cannot see returns `404`.
 - A role above the caller's role returns `403`. An existing member with a
   role above the caller's role also returns `403`.
-- When the email exists, the gateway adds that user to the workspace and does
-  not change the user's name or metadata.
+- When the email exists and the user is already a member of a workspace the
+  caller can see, the gateway adds that user to the workspace and does not
+  change the user's name or metadata.
+- When the user is not visible to the caller (a member only of other tenants'
+  workspaces, or of none), the gateway writes nothing and returns `409` with
+  `{"error":{"message":"a user with this email already exists; ask a global administrator to add the user to your workspace"}}`.
+  The response contains no user data. A global caller can add the user.
 
 ### `GET /api/users`
 
@@ -597,8 +602,9 @@ Creates or updates a workspace membership.
 ```
 
 `role` defaults to `viewer`. For a [scoped caller](#tenant-scope), a
-workspace that the caller cannot see returns `404`, an unknown user returns
-`404`, and a role above the caller's role returns `403`. A member who has a
+workspace that the caller cannot see returns `404`, an unknown user or a user
+who is not a member of any workspace the caller can see returns `404` ("user
+not found"), and a role above the caller's role returns `403`. A member who has a
 role above the caller's role also returns `403`.
 
 ### `GET /api/workspace-members`
@@ -741,9 +747,13 @@ Role checks apply to all callers. In addition, a scoped caller sees and
 changes only the records of its tenant: a workspace-scoped caller sees its
 workspace, and an organization-scoped caller sees all workspaces of its
 organization. A scoped caller never sees records that have no tenant.
-Request logs and feedback record the tenant of the caller that created
-them. Rows written before this release have no tenant, so only global
-callers see them.
+Request logs (including MCP tool calls) and feedback record the tenant of
+the caller that created them. Rows written before this release have no
+tenant, so only global callers see them. An organization-scoped caller sees
+a log or feedback row that has a workspace when its organization owns that
+workspace (looked up in the workspaces table, not taken from the
+organization recorded with the row). It sees a row without a workspace when
+the recorded organization is its own.
 
 A record outside the caller's tenant returns `404`, the same as a missing
 record. Gateway-wide resources return `403` to scoped callers:
