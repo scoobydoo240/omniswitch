@@ -82,5 +82,7 @@ func storeRequestLog(event Event) store.RequestLog {
 		DecisionReason: event.Reason,
 		LatencyMs:      float64(event.Latency.Microseconds()) / 1000,
 		Metadata:       string(encoded),
+		WorkspaceID:    event.Workspace,
+		OrganizationID: event.Organization,
 	}
 }

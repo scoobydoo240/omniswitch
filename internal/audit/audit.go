@@ -26,11 +26,14 @@ type Event struct {
 	Method string `json:"method,omitempty"`
 	// Target is the MCP target that received (or would have received) the call.
 	Target string `json:"target,omitempty"`
-	// KeyID and Workspace identify the authenticated caller.
-	KeyID     string `json:"key_id,omitempty"`
-	Workspace string `json:"workspace_id,omitempty"`
-	Session   string `json:"session_id,omitempty"`
-	TraceID   string `json:"trace_id,omitempty"`
+	// KeyID, Workspace and Organization identify the authenticated
+	// caller. Workspace and Organization are the caller's tenant, so
+	// tenant-scoped dashboard reads include the caller's MCP calls.
+	KeyID        string `json:"key_id,omitempty"`
+	Workspace    string `json:"workspace_id,omitempty"`
+	Organization string `json:"organization_id,omitempty"`
+	Session      string `json:"session_id,omitempty"`
+	TraceID      string `json:"trace_id,omitempty"`
 }
 
 type Logger interface {

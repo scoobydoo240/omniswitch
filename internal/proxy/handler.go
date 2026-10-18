@@ -472,6 +472,7 @@ func (h *Handler) audit(r *http.Request, method string, req model.ToolRequest, d
 	event.Method = method
 	event.KeyID = r.Header.Get("x-omniswitch-key-id")
 	event.Workspace = r.Header.Get("x-omniswitch-workspace-id")
+	event.Organization = r.Header.Get("x-omniswitch-organization-id")
 	if sc := oteltrace.SpanContextFromContext(r.Context()); sc.IsValid() {
 		event.TraceID = sc.TraceID().String()
 	}
