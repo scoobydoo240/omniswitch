@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -221,12 +220,15 @@ func (h *Handler) UpsertWorkspaceMember(w http.ResponseWriter, r *http.Request) 
 		if !h.authorizeMembership(w, r, scope, member) {
 			return
 		}
-		if _, err := h.store.GetUserByID(r.Context(), member.UserID); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusNotFound, "user not found")
-				return
-			}
+		// A user outside the caller's tenant gets the same 404 as a
+		// missing one (see tenant.go).
+		visible, err := h.store.UserVisibleToTenant(r.Context(), tenantFilter(r), member.UserID)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !visible {
+			writeError(w, http.StatusNotFound, "user not found")
 			return
 		}
 	}

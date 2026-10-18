@@ -136,7 +136,7 @@ func TestAddUserToWorkspaceNeverChangesExistingUser(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, st *Store) {
 		seedTenants(t, st)
 		ctx := context.Background()
-		user, member, err := st.AddUserToWorkspace(ctx,
+		user, member, err := st.AddUserToWorkspace(ctx, TenantFilter{OrganizationID: "org_a"},
 			User{ID: "new_id", Email: "shared@example.com", Name: "renamed", Metadata: map[string]string{"x": "y"}},
 			WorkspaceMember{WorkspaceID: "ws_a2", Role: "member"})
 		if err != nil {
@@ -153,7 +153,7 @@ func TestAddUserToWorkspaceNeverChangesExistingUser(t *testing.T) {
 			t.Fatalf("membership = %+v, %v", got, err)
 		}
 
-		fresh, _, err := st.AddUserToWorkspace(ctx, User{ID: "u_new", Email: "new@example.com", Name: "New"}, WorkspaceMember{WorkspaceID: "ws_b", Role: "viewer"})
+		fresh, _, err := st.AddUserToWorkspace(ctx, TenantFilter{WorkspaceID: "ws_b"}, User{ID: "u_new", Email: "new@example.com", Name: "New"}, WorkspaceMember{WorkspaceID: "ws_b", Role: "viewer"})
 		if err != nil || fresh.ID != "u_new" || fresh.Name != "New" {
 			t.Fatalf("new user = %+v, %v", fresh, err)
 		}

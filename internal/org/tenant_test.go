@@ -2,6 +2,7 @@ package org
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -150,7 +151,10 @@ func TestOrgWritesAreTenantScoped(t *testing.T) {
 		{"organization cannot forge organization_id", orgAdmin, func(h *Handler) http.HandlerFunc { return h.CreateWorkspace }, "/api/workspaces", `{"organization_id":"org_b","name":"x"}`, http.StatusNotFound},
 		{"workspace cannot create workspace", wsAdmin, func(h *Handler) http.HandlerFunc { return h.CreateWorkspace }, "/api/workspaces", `{"organization_id":"org_a","name":"x"}`, http.StatusForbidden},
 
-		{"workspace adds member to own workspace", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_a1","user_id":"ub","role":"member"}`, http.StatusOK},
+		{"workspace changes member of own workspace", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_a1","user_id":"shared","role":"member"}`, http.StatusOK},
+		{"workspace cannot add user of other tenant", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_a1","user_id":"ub","role":"member"}`, http.StatusNotFound},
+		{"workspace cannot add user of sibling workspace", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_a1","user_id":"ua2","role":"viewer"}`, http.StatusNotFound},
+		{"organization cannot add user of other organization", orgAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_a2","user_id":"ub","role":"viewer"}`, http.StatusNotFound},
 		{"workspace cannot add member to sibling", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_a2","user_id":"ua","role":"viewer"}`, http.StatusNotFound},
 		{"workspace cannot change member of other tenant", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_b","user_id":"ub","role":"admin"}`, http.StatusNotFound},
 		{"workspace cannot use unknown workspace", wsAdmin, func(h *Handler) http.HandlerFunc { return h.UpsertWorkspaceMember }, "/api/workspace-members", `{"workspace_id":"ws_zz","user_id":"ua","role":"viewer"}`, http.StatusNotFound},
@@ -188,21 +192,22 @@ func TestOrgCreatedRecordsStayInTenant(t *testing.T) {
 		t.Fatalf("created workspace = %+v, %v; want it in org_a", ws, err)
 	}
 
-	// A workspace admin "creating" a user that already exists elsewhere
-	// adds the shared identity to its workspace but never renames it.
-	rec = call(wsAdmin, h.CreateUser, http.MethodPost, "/api/users", `{"email":"ub@example.com","name":"hijacked","metadata":{"x":"y"}}`)
+	// An organization admin "creating" a user that already exists in
+	// another workspace of its organization adds the shared identity to
+	// the workspace but never renames it.
+	rec = call(orgAdmin, h.CreateUser, http.MethodPost, "/api/users", `{"email":"ua2@example.com","name":"hijacked","metadata":{"x":"y"},"workspace_id":"ws_a1"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("CreateUser status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	user, err := st.GetUserByID(t.Context(), "ub")
-	if err != nil || user.Name != "ub" || len(user.Metadata) != 0 {
-		t.Fatalf("user ub = %+v, %v; want unchanged", user, err)
+	user, err := st.GetUserByID(t.Context(), "ua2")
+	if err != nil || user.Name != "ua2" || len(user.Metadata) != 0 {
+		t.Fatalf("user ua2 = %+v, %v; want unchanged", user, err)
 	}
-	if m, err := st.GetWorkspaceMember(t.Context(), "ws_a1", "ub"); err != nil || m.Role != "viewer" {
+	if m, err := st.GetWorkspaceMember(t.Context(), "ws_a1", "ua2"); err != nil || m.Role != "viewer" {
 		t.Fatalf("membership = %+v, %v; want viewer in ws_a1", m, err)
 	}
-	if _, err := st.GetWorkspaceMember(t.Context(), "ws_b", "ub"); err != nil {
-		t.Fatalf("membership in ws_b lost: %v", err)
+	if _, err := st.GetWorkspaceMember(t.Context(), "ws_a2", "ua2"); err != nil {
+		t.Fatalf("membership in ws_a2 lost: %v", err)
 	}
 
 	// A new user created by a workspace admin is visible to it and not to
@@ -222,5 +227,58 @@ func TestOrgCreatedRecordsStayInTenant(t *testing.T) {
 	}
 	if user, _ := st.GetUserByID(t.Context(), "ub"); user.Name != "renamed" {
 		t.Fatalf("global rename = %+v", user)
+	}
+}
+
+// TestScopedCreateUserCannotTakeInOtherTenantsUser covers T1: a scoped
+// admin that names the email of a user it cannot see gets a 409 without
+// any user data, and no membership is written.
+func TestScopedCreateUserCannotTakeInOtherTenantsUser(t *testing.T) {
+	wsBAdmin := &gateway.Identity{APIKeyID: "wb", Role: "admin", WorkspaceID: "ws_b", OrganizationID: "org_b"}
+	orgBAdmin := &gateway.Identity{APIKeyID: "ob", Role: "admin", OrganizationID: "org_b"}
+	for _, tc := range []struct {
+		name      string
+		caller    *gateway.Identity
+		body      string
+		user      string // the existing user the email belongs to
+		workspace string // the workspace the caller tried to add it to
+	}{
+		{"workspace admin, user of other organization", wsBAdmin, `{"email":"ua@example.com","name":"x","metadata":{"k":"v"}}`, "ua", "ws_b"},
+		{"organization admin, user of other organization", orgBAdmin, `{"email":"ua@example.com","workspace_id":"ws_b"}`, "ua", "ws_b"},
+		{"workspace admin, user of sibling workspace", wsAdmin, `{"email":"ua2@example.com"}`, "ua2", "ws_a1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, h := seedOrgTenants(t)
+			rec := call(tc.caller, h.CreateUser, http.MethodPost, "/api/users", tc.body)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, errUserOutsideTenant) {
+				t.Fatalf("body = %s, want the 409 message", body)
+			}
+			for _, leak := range []string{`"id"`, `"name"`, `"created_at"`, `"metadata"`, `"ua"`, `"ua2"`} {
+				if strings.Contains(body, leak) {
+					t.Fatalf("409 body leaks %s: %s", leak, body)
+				}
+			}
+			if m, err := st.GetWorkspaceMember(t.Context(), tc.workspace, tc.user); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("membership written: %+v, %v", m, err)
+			}
+			for _, id := range listIDs(t, call(tc.caller, h.ListUsers, http.MethodGet, "/api/users", ""), "users") {
+				if id == tc.user {
+					t.Fatalf("caller lists user %s after the 409", id)
+				}
+			}
+		})
+	}
+
+	// New emails and global callers are unchanged.
+	_, h := seedOrgTenants(t)
+	if rec := call(wsBAdmin, h.CreateUser, http.MethodPost, "/api/users", `{"email":"brand-new@example.com"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("new email status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(globalAdmin, h.CreateUser, http.MethodPost, "/api/users", `{"email":"ua@example.com","workspace_id":"ws_b"}`); rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"ua"`) {
+		t.Fatalf("global status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }

@@ -169,10 +169,10 @@ func (s *Store) ListUsersForTenant(ctx context.Context, f TenantFilter) ([]User,
 	if f.Global() {
 		return s.ListUsers(ctx)
 	}
-	cond, arg := memberTenantCondition(f)
+	cond, arg := userVisibleCondition(f)
 	rows, err := s.query(ctx,
 		"SELECT u.id, u.email, COALESCE(u.name, ''), u.created_at, COALESCE(u.metadata, '') FROM users u "+
-			"WHERE EXISTS (SELECT 1 FROM workspace_members m WHERE m.user_id = u.id AND "+cond+") ORDER BY u.created_at DESC",
+			"WHERE "+cond+" ORDER BY u.created_at DESC",
 		arg,
 	)
 	if err != nil {
@@ -238,13 +238,52 @@ func (s *Store) GetWorkspaceMember(ctx context.Context, workspaceID, userID stri
 	return member, nil
 }
 
+// ErrUserNotVisible is returned by AddUserToWorkspace when the email
+// belongs to a user that the tenant filter cannot see. The caller must not
+// learn anything about that user beyond the fact that the email is taken.
+var ErrUserNotVisible = errors.New("user exists outside the tenant")
+
+// userVisibleCondition returns a SQL condition, over a users row aliased u,
+// that holds when the user is a member of at least one workspace the filter
+// can see (the ListUsersForTenant rule). It must not be called with a
+// global filter.
+func userVisibleCondition(f TenantFilter) (string, any) {
+	cond, arg := memberTenantCondition(f)
+	return "EXISTS (SELECT 1 FROM workspace_members m WHERE m.user_id = u.id AND " + cond + ")", arg
+}
+
+// UserVisibleToTenant reports whether the user with userID exists and the
+// filter can see it: always for a global filter, otherwise only when the
+// user is a member of a workspace the filter can see.
+func (s *Store) UserVisibleToTenant(ctx context.Context, f TenantFilter, userID string) (bool, error) {
+	where, args := "u.id = ?", []any{userID}
+	if !f.Global() {
+		cond, arg := userVisibleCondition(f)
+		where += " AND " + cond
+		args = append(args, arg)
+	}
+	var one int
+	err := s.queryRow(ctx, "SELECT 1 FROM users u WHERE "+where, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // AddUserToWorkspace creates user if its email is new and adds it to
 // member.WorkspaceID with member.Role, in one transaction. Unlike UpsertUser
 // it never changes an existing user: users are shared between tenants, so
 // a tenant-scoped admin must not rename or relabel an identity that other
 // tenants also use. It returns the stored user (with the stored ID when the
 // email already existed) and the stored membership.
-func (s *Store) AddUserToWorkspace(ctx context.Context, user User, member WorkspaceMember) (User, WorkspaceMember, error) {
+//
+// For a scoped filter an existing user must already be visible to the
+// filter (a member of a workspace it can see); otherwise nothing is
+// written and ErrUserNotVisible is returned with a zero User, so a scoped
+// admin cannot take in, or read, a user of another tenant by email. The
+// check runs inside the transaction after the insert, so a concurrent
+// create of the same email gets the same answer.
+func (s *Store) AddUserToWorkspace(ctx context.Context, f TenantFilter, user User, member WorkspaceMember) (User, WorkspaceMember, error) {
 	if user.CreatedAt.IsZero() {
 		user.CreatedAt = time.Now().UTC()
 	}
@@ -254,35 +293,54 @@ func (s *Store) AddUserToWorkspace(ctx context.Context, user User, member Worksp
 	metadata, _ := json.Marshal(user.Metadata)
 	tx, err := s.wdb.BeginTx(ctx, nil)
 	if err != nil {
-		return user, member, err
+		return User{}, member, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, s.txSQL(
+	res, err := tx.ExecContext(ctx, s.txSQL(
 		`INSERT INTO users (id, email, name, created_at, metadata) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(email) DO NOTHING`),
 		user.ID, user.Email, user.Name, formatTime(user.CreatedAt), string(metadata),
-	); err != nil {
-		return user, member, err
+	)
+	if err != nil {
+		return User{}, member, err
 	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return User{}, member, err
+	}
+	stored := User{Email: user.Email}
 	var createdAt, storedMetadata string
 	if err := tx.QueryRowContext(ctx, s.txSQL(
 		"SELECT id, COALESCE(name, ''), created_at, COALESCE(metadata, '') FROM users WHERE email = ?"), user.Email,
-	).Scan(&user.ID, &user.Name, &createdAt, &storedMetadata); err != nil {
-		return user, member, fmt.Errorf("read user: %w", err)
+	).Scan(&stored.ID, &stored.Name, &createdAt, &storedMetadata); err != nil {
+		return User{}, member, fmt.Errorf("read user: %w", err)
 	}
-	user.CreatedAt = parseTime(createdAt)
-	user.Metadata = nil
-	_ = json.Unmarshal([]byte(storedMetadata), &user.Metadata)
-	member.UserID = user.ID
+	if inserted == 0 && !f.Global() {
+		cond, arg := userVisibleCondition(f)
+		var one int
+		err := tx.QueryRowContext(ctx, s.txSQL("SELECT 1 FROM users u WHERE u.id = ? AND "+cond), stored.ID, arg).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, member, ErrUserNotVisible
+		}
+		if err != nil {
+			return User{}, member, err
+		}
+	}
+	stored.CreatedAt = parseTime(createdAt)
+	_ = json.Unmarshal([]byte(storedMetadata), &stored.Metadata)
+	member.UserID = stored.ID
 	if _, err := tx.ExecContext(ctx, s.txSQL(
 		`INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role`),
 		member.WorkspaceID, member.UserID, member.Role, formatTime(member.CreatedAt),
 	); err != nil {
-		return user, member, err
+		return User{}, member, err
 	}
-	return user, member, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return User{}, member, err
+	}
+	return stored, member, nil
 }
 
 // promptColumns selects a prompts row in scanPrompt order.

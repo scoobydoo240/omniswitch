@@ -15,11 +15,17 @@ package org
 // workspaces, and manage only the members of their own workspace.
 //
 // Users are shared identities: one user may belong to workspaces of several
-// tenants. A scoped caller lists only users who are members of a workspace
-// it can see. It creates a user only together with a membership in a
-// workspace it can see, and it never changes an existing user: when the
-// email already exists, the stored user is added to the workspace with its
-// name and metadata unchanged. Only global callers can rename users.
+// tenants. A user is visible to a scoped caller when it is a member of at
+// least one workspace the caller can see; a scoped caller lists only those
+// users. It creates a user only together with a membership in a workspace
+// it can see, and it never changes an existing user. When the email
+// already exists and the user is visible, the stored user is added to the
+// workspace with its name and metadata unchanged. When the user is not
+// visible (a member only of other tenants' workspaces, or of none), nothing
+// is written and the caller gets a 409 without any user data: only a
+// global administrator can bring that user into the tenant. Likewise a
+// membership change that names a user who is not visible gets the same 404
+// as a missing user. Only global callers can rename users.
 //
 // A scoped caller cannot grant a membership role above its own role, and
 // cannot change a membership that already holds a role above its own, in
@@ -37,6 +43,10 @@ import (
 	"github.com/omniswitch-dev/omniswitch/internal/gateway"
 	"github.com/omniswitch-dev/omniswitch/internal/store"
 )
+
+// errUserOutsideTenant is the 409 message for a scoped caller that names
+// the email of a user it cannot see. It carries no user data.
+const errUserOutsideTenant = "a user with this email already exists; ask a global administrator to add the user to your workspace"
 
 // tenantFilter returns the store filter for the caller of r.
 func tenantFilter(r *http.Request) store.TenantFilter {
@@ -112,6 +122,7 @@ func (h *Handler) createScopedUser(w http.ResponseWriter, r *http.Request, scope
 	// For an existing email, authorizeMembership also checks the user's
 	// current membership in the workspace, so a lower-ranked caller cannot
 	// demote a higher-ranked member through this endpoint.
+	filter := tenantFilter(r)
 	existing, err := h.store.GetUserByEmail(r.Context(), user.Email)
 	switch {
 	case err == nil:
@@ -123,7 +134,26 @@ func (h *Handler) createScopedUser(w http.ResponseWriter, r *http.Request, scope
 	if !h.authorizeMembership(w, r, scope, member) {
 		return
 	}
-	stored, _, err := h.store.AddUserToWorkspace(r.Context(), user, member)
+	if member.UserID != "" {
+		// Only a user the caller can already see may be added; the
+		// check runs before any write and answers without user data.
+		visible, err := h.store.UserVisibleToTenant(r.Context(), filter, member.UserID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !visible {
+			writeError(w, http.StatusConflict, errUserOutsideTenant)
+			return
+		}
+	}
+	// AddUserToWorkspace repeats the visibility check in its transaction,
+	// for an email created concurrently by another tenant.
+	stored, _, err := h.store.AddUserToWorkspace(r.Context(), filter, user, member)
+	if errors.Is(err, store.ErrUserNotVisible) {
+		writeError(w, http.StatusConflict, errUserOutsideTenant)
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
