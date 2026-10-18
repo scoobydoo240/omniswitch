@@ -13,7 +13,9 @@ import (
 // WorkspaceID and OrganizationID are the caller's tenant: a non-empty
 // WorkspaceID limits the read to that workspace (OrganizationID is then
 // ignored), otherwise a non-empty OrganizationID limits it to that
-// organization. Rows written before the tenant columns existed have no
+// organization: rows of the organization's workspaces (by the workspaces
+// table, not by the organization logged with the row) and rows without a
+// workspace whose logged organization matches. Rows written before the tenant columns existed have no
 // tenant, so only an unscoped read returns them. APIKeyID further limits
 // request logs to one API key; feedback has no key and ignores it.
 type LogScope struct {
@@ -34,8 +36,19 @@ func (s LogScope) where(base string, args []any) (string, []any) {
 		where += " AND workspace_id = ?"
 		args = append(args, s.WorkspaceID)
 	case s.OrganizationID != "":
-		where += " AND organization_id = ?"
-		args = append(args, s.OrganizationID)
+		// The organization logged with a row is the caller's claim
+		// (an OIDC organization claim, or empty when an API key's
+		// workspace could not be read). A row with a workspace belongs
+		// to the organization that owns the workspace; only a row
+		// without a workspace ('') falls back to the logged
+		// organization. The IN list is the organization's workspaces
+		// plus '' so both backends run it as an index lookup on
+		// workspace_id instead of scanning the table for an OR.
+		// workspace_id is never NULL: the column defaults to '' and
+		// every insert writes a string.
+		where += " AND workspace_id IN (SELECT id FROM workspaces WHERE organization_id = ? UNION ALL SELECT '')" +
+			" AND (workspace_id <> '' OR organization_id = ?)"
+		args = append(args, s.OrganizationID, s.OrganizationID)
 	}
 	return where, args
 }

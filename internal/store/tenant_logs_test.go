@@ -10,12 +10,32 @@ import (
 	"time"
 )
 
+// seedLogTenants stores organizations o1 (workspaces w1, w2) and o2
+// (workspace w3). Organization filters resolve a row's workspace through
+// the workspaces table.
+func seedLogTenants(t *testing.T, st *Store) {
+	t.Helper()
+	ctx := context.Background()
+	for _, id := range []string{"o1", "o2"} {
+		if err := st.InsertOrganization(ctx, Organization{ID: id, Name: id, CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, ws := range []Workspace{{ID: "w1", OrganizationID: "o1"}, {ID: "w2", OrganizationID: "o1"}, {ID: "w3", OrganizationID: "o2"}} {
+		ws.Name, ws.CreatedAt = ws.ID, time.Now().UTC()
+		if err := st.InsertWorkspace(ctx, ws); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // seedTenantLogs writes one log per tenant: workspace w1 and w2 in
 // organization o1, workspace w3 in organization o2, and a legacy row with
 // no tenant. Every log shares trace "shared" and has its own trace too.
 func seedTenantLogs(t *testing.T, st *Store) {
 	t.Helper()
 	ctx := context.Background()
+	seedLogTenants(t, st)
 	now := time.Now().UTC()
 	rows := []RequestLog{
 		{ID: "r1", TraceID: "shared", WorkspaceID: "w1", OrganizationID: "o1", APIKeyID: "k1", Cost: 1},
@@ -208,6 +228,85 @@ func TestTenantScopedFeedbackAndReferences(t *testing.T) {
 	})
 }
 
+// TestOrganizationScopeUsesWorkspaceOwner checks that an organization
+// filter matches a row with a workspace by the organization that owns the
+// workspace, not by the organization logged with the row (the caller's
+// claim), and a row without a workspace by the logged organization (T3).
+func TestOrganizationScopeUsesWorkspaceOwner(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, st *Store) {
+		seedLogTenants(t, st)
+		ctx := context.Background()
+		now := time.Now().UTC()
+		for i, row := range []RequestLog{
+			// w1 belongs to o1; the IdP sent no organization claim.
+			{ID: "no-claim", TraceID: "t", WorkspaceID: "w1"},
+			// w1 belongs to o1; the token claims organization o2.
+			{ID: "wrong-claim", TraceID: "t", WorkspaceID: "w1", OrganizationID: "o2"},
+			// No workspace: the logged organization decides.
+			{ID: "org-only", TraceID: "t", OrganizationID: "o1"},
+		} {
+			row.Timestamp = now.Add(time.Duration(i) * time.Millisecond)
+			row.Provider, row.Status = "p-"+row.ID, "success"
+			if err := st.InsertLog(ctx, row); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.InsertFeedback(ctx, Feedback{ID: "f-" + row.ID, RequestID: row.ID, TraceID: "t", Timestamp: now,
+				WorkspaceID: row.WorkspaceID, OrganizationID: row.OrganizationID}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		since := now.Add(-time.Hour)
+		for _, tc := range []struct {
+			org  string
+			want []string
+		}{
+			{"o1", []string{"no-claim", "org-only", "wrong-claim"}},
+			{"o2", nil},
+			{"o3", nil},
+		} {
+			scope := LogScope{OrganizationID: tc.org}
+			logs, total, err := st.ListLogsInScope(ctx, scope, 10, 0, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := tenantLogIDs(logs); !equalIDs(got, tc.want...) || total != len(tc.want) {
+				t.Fatalf("%s: ListLogsInScope() = %v (total %d), want %v", tc.org, got, total, tc.want)
+			}
+			if m, err := st.GetMetricsInScope(ctx, since, scope); err != nil || m.TotalRequests != len(tc.want) {
+				t.Fatalf("%s: GetMetricsInScope() = %+v, %v; want %d requests", tc.org, m, err, len(tc.want))
+			}
+			fb, err := st.ListFeedbackInScope(ctx, scope, 10, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fbIDs []string
+			for _, f := range fb {
+				fbIDs = append(fbIDs, f.RequestID)
+			}
+			sort.Strings(fbIDs)
+			if !equalIDs(fbIDs, tc.want...) {
+				t.Fatalf("%s: ListFeedbackInScope() = %v, want %v", tc.org, fbIDs, tc.want)
+			}
+			for _, id := range []string{"no-claim", "wrong-claim", "org-only"} {
+				ok, err := st.RequestLogInScope(ctx, id, scope)
+				if err != nil || ok != contains(tc.want, id) {
+					t.Fatalf("%s: RequestLogInScope(%s) = %v, %v", tc.org, id, ok, err)
+				}
+			}
+			detail, err := st.GetTraceInScope(ctx, "t", scope)
+			if len(tc.want) == 0 {
+				if !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("%s: GetTraceInScope() error = %v, want sql.ErrNoRows", tc.org, err)
+				}
+				continue
+			}
+			if err != nil || !equalIDs(tenantLogIDs(detail.Logs), tc.want...) {
+				t.Fatalf("%s: GetTraceInScope() = %v, %v", tc.org, tenantLogIDs(detail.Logs), err)
+			}
+		}
+	})
+}
+
 // legacyTenantTables is what a release before the tenant columns left
 // behind: request_logs and feedback without workspace_id / organization_id.
 var legacyTenantTables = []string{
@@ -244,6 +343,7 @@ func checkTenantUpgrade(t *testing.T, st *Store) {
 	if fb, err := st.ListFeedbackInScope(ctx, LogScope{}, 10, "", ""); err != nil || len(fb) != 1 || fb[0].ID != "fb-old" {
 		t.Fatalf("global ListFeedbackInScope() = %v, %v; want the legacy row", fb, err)
 	}
+	seedLogTenants(t, st)
 	if err := st.InsertLog(ctx, RequestLog{ID: "new", Timestamp: time.Now(), WorkspaceID: "w1", OrganizationID: "o1"}); err != nil {
 		t.Fatal(err)
 	}

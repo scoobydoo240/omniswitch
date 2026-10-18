@@ -32,6 +32,14 @@ func newTenantFeedback(t *testing.T) *Handler {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// Organization reads resolve a row's workspace through the
+	// workspaces table.
+	for _, ws := range []store.Workspace{{ID: "w1", OrganizationID: "o1"}, {ID: "w2", OrganizationID: "o1"}, {ID: "w3", OrganizationID: "o2"}} {
+		ws.Name, ws.CreatedAt = ws.ID, time.Now()
+		if err := st.InsertWorkspace(context.Background(), ws); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, row := range []store.RequestLog{
 		{ID: "r0", TraceID: "t0"},
 		{ID: "r1", TraceID: "t1", WorkspaceID: "w1", OrganizationID: "o1"},
