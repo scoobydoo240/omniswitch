@@ -290,7 +290,10 @@ Anthropic Claude models reject a request that sets both `temperature` and
 `top_p`. When a request sets both, the `anthropic` adapter sends only
 `temperature`. The `bedrock` adapter applies the same rule to Claude model
 IDs (IDs that contain `anthropic.` or `claude`). Other Bedrock models get
-both values. A request that sets only `top_p` keeps it.
+both values. A request that sets only `top_p` keeps it. Application inference
+profile ARNs (`...:application-inference-profile/<id>`) do not name the model,
+so they are not detected as Claude and get both values; send only one of them
+for such profiles (see [`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md)).
 
 ### Cohere
 

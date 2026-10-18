@@ -691,6 +691,18 @@ that set `openapi_spec` (see "OpenAPI-to-MCP conversion" in
 [`CONFIGURATION.md`](CONFIGURATION.md)). A2A is exposed separately through
 the `/.well-known/agent-card.json` and `/a2a` endpoints.
 
+Policies read the raw tool arguments as `args` (for example
+`has(args.table) && args.table == "users"`). Argument names match regardless
+of case at every nesting level (`args.options.mode` also matches
+`{"Options":{"Mode":...}}`), the same way OmniSwitch derives `resource.name`,
+`resource.environment` and `action.name`, because MCP servers often decode
+arguments without regard to case. An exact name match wins. `size(args)` and
+iteration (`exists`, `all`, `map`) see only the names as sent, and comparing
+`args` (or a nested object) with a map literal looks up the literal's keys
+the same case-insensitive way. Requests with argument names that differ only
+in case are rejected with `-32600`. Integer arguments are `int`, other
+numbers `double`.
+
 ## Roles and Scopes
 
 When `OMNISWITCH_AUTH=true`, API-key roles are `viewer`, `member`, `admin`, and
